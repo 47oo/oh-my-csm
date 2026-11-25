@@ -251,13 +251,29 @@ async def create_device(
     auth: AuthContext = Depends(get_current_auth),
     db: AsyncSession = Depends(get_db),
 ) -> DeviceOut:
-    if not auth.has_permission_in_group("asset:write", body.group_id):
-        write_scope = await resolve_scope(db, auth, "asset:write")
-        if not body.cluster_ids or not all(cid in write_scope.cluster_ids for cid in body.cluster_ids):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="仅集群授权用户新建设备时必须关联至少一个有写权限的集群",
+    write_scope = await resolve_scope(db, auth, "asset:write")
+    unique_cids = sorted(set(body.cluster_ids or []))
+    if unique_cids:
+        cl_rows = list(
+            (
+                await db.execute(
+                    select(Cluster).where(Cluster.id.in_(unique_cids), Cluster.deleted_at.is_(None))
+                )
             )
+            .scalars()
+            .all()
+        )
+        if len(cl_rows) != len(unique_cids):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="包含不存在的集群")
+        for cl in cl_rows:
+            await require_entity_permission(
+                db, auth, "cluster", cl.id, cl.group_id, "asset:write", scope=write_scope
+            )
+    if not auth.has_permission_in_group("asset:write", body.group_id) and not unique_cids:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="仅集群授权用户新建设备时必须关联至少一个有写权限的集群",
+        )
 
     hostname = body.hostname.strip()
     asset_code = body.asset_code.strip() if body.asset_code and body.asset_code.strip() else None
@@ -556,8 +572,47 @@ async def update_device(
     await db.flush()
 
     if body.cluster_ids is not None:
+        new_cids = set(body.cluster_ids)
+        current_cids = set(
+            (
+                await db.execute(
+                    select(ClusterDevice.cluster_id).where(ClusterDevice.device_id == device.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        changed_cids = new_cids ^ current_cids
+        if changed_cids:
+            write_scope = await resolve_scope(db, auth, "asset:write")
+            cl_rows = {
+                cl.id: cl
+                for cl in (
+                    await db.execute(
+                        select(Cluster).where(
+                            Cluster.id.in_(changed_cids), Cluster.deleted_at.is_(None)
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            }
+            added_cids = new_cids - current_cids
+            if any(cid not in cl_rows for cid in added_cids):
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="包含不存在的集群")
+            for cid in changed_cids:
+                cl = cl_rows.get(cid)
+                await require_entity_permission(
+                    db,
+                    auth,
+                    "cluster",
+                    cid,
+                    cl.group_id if cl else None,
+                    "asset:write",
+                    scope=write_scope,
+                )
         await db.execute(delete(ClusterDevice).where(ClusterDevice.device_id == device.id))
-        for cid in sorted(set(body.cluster_ids)):
+        for cid in sorted(new_cids):
             db.add(ClusterDevice(cluster_id=cid, device_id=device.id))
         await db.flush()
 

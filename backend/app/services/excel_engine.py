@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -425,6 +426,9 @@ def _apply_field_update(
     return changed
 
 
+UPLOAD_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
 async def run_excel_import(
     db: AsyncSession,
     auth: AuthContext,
@@ -432,8 +436,19 @@ async def run_excel_import(
     *,
     commit_mode: bool,
 ) -> ExcelPreviewOut | ExcelCommitOut:
-    xlsx_path = UPLOAD_STAGING_DIR / f"{req.upload_id}.xlsx"
-    name_path = UPLOAD_STAGING_DIR / f"{req.upload_id}.name"
+    if not UPLOAD_ID_RE.match(req.upload_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="无效的上传会话 ID",
+        )
+    staging_root = UPLOAD_STAGING_DIR.resolve()
+    xlsx_path = (staging_root / f"{req.upload_id}.xlsx").resolve()
+    name_path = (staging_root / f"{req.upload_id}.name").resolve()
+    if xlsx_path.parent != staging_root or name_path.parent != staging_root:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="非法的上传会话路径",
+        )
     if not xlsx_path.exists():
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -627,6 +642,21 @@ async def run_excel_import(
             return
         raise ValueError("缺少目标分组或集群的 excel:import / asset:write 权限")
 
+    async def _require_existing_perm(
+        entity_type: str, obj_id: int, obj_gid: int | None
+    ) -> None:
+        if auth.has_permission_in_group("excel:import", obj_gid) and auth.has_permission_in_group(
+            "asset:write", obj_gid
+        ):
+            return
+        imp_scope = await resolve_scope(db, auth, "excel:import")
+        wrt_scope = await resolve_scope(db, auth, "asset:write")
+        if imp_scope.allows(entity_type, obj_id, obj_gid) and wrt_scope.allows(
+            entity_type, obj_id, obj_gid
+        ):
+            return
+        raise ValueError(f"无权操作已有 {entity_type} 记录（超出当前分组或集群授权范围）")
+
     results: list[ExcelRowResult] = []
     batch_obj: ImportBatch | None = None
 
@@ -718,13 +748,13 @@ async def run_excel_import(
                 zid = _resolve_zone(rec.get("network_zone_code") or "")
                 env = rec.get("env") or None
                 existing_id = cluster_id_cache.get(name)
-                _check_import_perm(gid, [existing_id] if existing_id is not None else None)
                 if existing_id is not None:
+                    existing = await db.get(Cluster, existing_id)
+                    assert existing is not None
+                    await _require_existing_perm("cluster", existing.id, existing.group_id)
                     if req.conflict_strategy == "skip":
                         results.append(ExcelRowResult(sheet=sname, row_num=row_num, entity_type="cluster", natural_key=key, operation="skip", reason="已存在"))
                     else:
-                        existing = await db.get(Cluster, existing_id)
-                        assert existing is not None
                         changed = _apply_field_update(
                             existing,
                             {
@@ -744,6 +774,7 @@ async def run_excel_import(
                             await _audit_if_commit("update", "cluster", existing.id, existing.name, existing.group_id)
                         results.append(ExcelRowResult(sheet=sname, row_num=row_num, entity_type="cluster", natural_key=key, operation=op_type))
                 else:
+                    _check_import_perm(gid)
                     obj = Cluster(
                         name=name,
                         code=rec.get("code") or None,
@@ -789,11 +820,12 @@ async def run_excel_import(
                 existing_dev_info = device_id_cache.get(hostname)
                 if existing_dev_info is not None:
                     target_dev_id = existing_dev_info[0]
+                    existing = await db.get(Device, target_dev_id)
+                    assert existing is not None
+                    await _require_existing_perm("device", existing.id, existing.group_id)
                     if req.conflict_strategy == "skip":
                         results.append(ExcelRowResult(sheet=sname, row_num=row_num, entity_type="device", natural_key=key, operation="skip", reason="已存在"))
                     else:
-                        existing = await db.get(Device, target_dev_id)
-                        assert existing is not None
                         merged_extra = {**(existing.extra_attrs or {}), **extra_kv} if extra_kv else existing.extra_attrs
                         changed = _apply_field_update(
                             existing,
@@ -844,12 +876,15 @@ async def run_excel_import(
                     await _audit_if_commit("create", "device", target_dev_id, hostname, gid)
                     results.append(ExcelRowResult(sheet=sname, row_num=row_num, entity_type="device", natural_key=key, operation="create"))
 
-                # Link clusters if provided
+                # Link clusters if provided (verify write permission on each target cluster)
                 cl_str = rec.get("cluster_names") or ""
                 for cname in [c.strip() for c in cl_str.replace("，", ",").split(",") if c.strip()]:
                     cl_id = cluster_id_cache.get(cname)
                     if cl_id is None:
                         raise ValueError(f"引用的集群 '{cname}' 不存在")
+                    cl_obj = await db.get(Cluster, cl_id)
+                    assert cl_obj is not None
+                    await _require_existing_perm("cluster", cl_obj.id, cl_obj.group_id)
                     link_exists = (
                         await db.execute(
                             select(ClusterDevice.cluster_id).where(
@@ -879,7 +914,7 @@ async def run_excel_import(
                 if dev_info is None:
                     raise ValueError(f"所属设备 '{dhost}' 不存在")
                 dev_id, dev_gid = dev_info
-                _check_import_perm(dev_gid)
+                await _require_existing_perm("device", dev_id, dev_gid)
                 mac = normalize_mac(rec.get("mac_address") or None)
                 parent_name = (rec.get("parent_nic_name") or "").strip()
                 parent_id: int | None = None
@@ -956,6 +991,8 @@ async def run_excel_import(
                 gid = _resolve_group(rec.get("group_code") or "")
 
                 nic_id: int | None = None
+                nic_dev_id: int | None = None
+                nic_dev_gid: int | None = None
                 dhost = (rec.get("device_hostname") or "").strip()
                 nname = (rec.get("nic_name") or "").strip()
                 if dhost and nname:
@@ -966,10 +1003,19 @@ async def run_excel_import(
                     nic_id = nic_id_cache.get((dev_id, nname))
                     if nic_id is None:
                         raise ValueError(f"绑定网卡 '{dhost}:{nname}' 不存在")
+                    nic_dev_id = dev_id
+                    nic_dev_gid = dev_gid
+                    await _require_existing_perm("device", dev_id, dev_gid)
                     if gid is None:
                         gid = dev_gid
 
-                _check_import_perm(gid)
+                if nic_dev_id is None:
+                    _check_import_perm(gid)
+                else:
+                    # Also validate explicit group_code if provided separately
+                    if rec.get("group_code"):
+                        _check_import_perm(gid)
+                    _ = nic_dev_gid
 
                 subnet_id: int | None = None
                 cidr_raw = (rec.get("subnet_cidr") or "").strip()
@@ -994,11 +1040,12 @@ async def run_excel_import(
 
                 existing_ip_id = ip_id_cache.get((zid, ip_str))
                 if existing_ip_id is not None:
+                    existing = await db.get(IPAddress, existing_ip_id)
+                    assert existing is not None
+                    await _require_existing_perm("ip", existing.id, existing.group_id)
                     if req.conflict_strategy == "skip":
                         results.append(ExcelRowResult(sheet=sname, row_num=row_num, entity_type="ip", natural_key=ip_str, operation="skip", reason="已存在"))
                     else:
-                        existing = await db.get(IPAddress, existing_ip_id)
-                        assert existing is not None
                         changed = _apply_field_update(
                             existing,
                             {
@@ -1059,11 +1106,12 @@ async def run_excel_import(
                 existing_svc_id = service_id_cache.get(svc_name)
                 if existing_svc_id is not None:
                     svc_id = existing_svc_id
+                    existing = await db.get(Service, existing_svc_id)
+                    assert existing is not None
+                    await _require_existing_perm("service", existing.id, existing.group_id)
                     if req.conflict_strategy == "skip":
                         op_type: Any = "skip"
                     else:
-                        existing = await db.get(Service, existing_svc_id)
-                        assert existing is not None
                         changed = _apply_field_update(
                             existing,
                             {
@@ -1167,20 +1215,30 @@ async def run_excel_import(
                     auth.has_permission_in_group("excel:import", gid)
                     and auth.has_permission_in_group("asset:write", gid)
                 ):
-                    import_scope = await resolve_scope(db, auth, "asset:write")
-                    ok_via_svc = svc_id is not None and import_scope.allows("service", svc_id, gid)
-                    ok_via_ip = entry_ip_id is not None and import_scope.allows("ip", entry_ip_id, gid)
+                    imp_scope = await resolve_scope(db, auth, "excel:import")
+                    wrt_scope = await resolve_scope(db, auth, "asset:write")
+                    ok_via_svc = (
+                        svc_id is not None
+                        and imp_scope.allows("service", svc_id, gid)
+                        and wrt_scope.allows("service", svc_id, gid)
+                    )
+                    ok_via_ip = (
+                        entry_ip_id is not None
+                        and imp_scope.allows("ip", entry_ip_id, gid)
+                        and wrt_scope.allows("ip", entry_ip_id, gid)
+                    )
                     if not (ok_via_svc or ok_via_ip):
                         raise ValueError("缺少目标分组或关联集群的 excel:import / asset:write 权限")
                 ssl_dt = _parse_date(rec.get("ssl_expires_at"))
 
                 existing_url_id = url_id_cache.get(parsed["full_url"])
                 if existing_url_id is not None:
+                    existing = await db.get(UrlEntry, existing_url_id)
+                    assert existing is not None
+                    await _require_existing_perm("url", existing.id, existing.group_id)
                     if req.conflict_strategy == "skip":
                         results.append(ExcelRowResult(sheet=sname, row_num=row_num, entity_type="url", natural_key=parsed["full_url"], operation="skip", reason="已存在"))
                     else:
-                        existing = await db.get(UrlEntry, existing_url_id)
-                        assert existing is not None
                         changed = _apply_field_update(
                             existing,
                             {
@@ -1330,7 +1388,7 @@ async def export_assets_workbook(
         for z in (await db.execute(select(NetworkZone).where(NetworkZone.deleted_at.is_(None)))).scalars().all()
     }
 
-    scope = await resolve_scope(db, auth, "asset:read")
+    scope = await resolve_scope(db, auth, "excel:export")
 
     def _scope_filter(model: Any, entity_type: str, has_env: bool = True):
         stmt = apply_scope_filter(

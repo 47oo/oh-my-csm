@@ -21,6 +21,7 @@ from app.models.assets import (
     ServiceEndpoint,
     UrlEntry,
 )
+from app.models.audit import AuditLog
 
 
 @dataclass
@@ -39,14 +40,8 @@ class ResolvedScope:
     url_ids: set[int] = field(default_factory=set)
     subnet_ids: set[int] = field(default_factory=set)
 
-    def allows(self, entity_type: str, entity_id: int, group_id: int | None) -> bool:
-        if self.unrestricted:
-            return True
-        if group_id is not None and group_id in self.group_ids:
-            return True
-        if group_id is None and self.allow_public:
-            return True
-        id_map = {
+    def entity_id_sets(self) -> dict[str, set[int]]:
+        return {
             "cluster": self.cluster_ids,
             "device": self.device_ids,
             "nic": self.nic_ids,
@@ -55,13 +50,23 @@ class ResolvedScope:
             "url": self.url_ids,
             "subnet": self.subnet_ids,
         }
-        return entity_id in id_map.get(entity_type, set())
+
+    def allows(self, entity_type: str, entity_id: int, group_id: int | None) -> bool:
+        if self.unrestricted:
+            return True
+        if group_id is not None and group_id in self.group_ids:
+            return True
+        if group_id is None and self.allow_public:
+            return True
+        return entity_id in self.entity_id_sets().get(entity_type, set())
 
 
 async def resolve_scope(
     db: AsyncSession,
     auth: AuthContext,
     permission: str = "asset:read",
+    *,
+    include_deleted: bool = False,
 ) -> ResolvedScope:
     """Resolve full-chain penetration IDs: Cluster -> Device -> NIC -> IP/VIP -> Service/Endpoint -> URL (+ Subnet)."""
     if auth.has_global_permission(permission):
@@ -73,14 +78,10 @@ async def resolve_scope(
 
     # Include clusters owned by user's permitted groups so group-owned clusters also penetrate cleanly
     if group_ids:
-        grp_clusters = (
-            await db.execute(
-                select(Cluster.id).where(
-                    Cluster.group_id.in_(group_ids),
-                    Cluster.deleted_at.is_(None),
-                )
-            )
-        ).scalars().all()
+        cl_stmt = select(Cluster.id).where(Cluster.group_id.in_(group_ids))
+        if not include_deleted:
+            cl_stmt = cl_stmt.where(Cluster.deleted_at.is_(None))
+        grp_clusters = (await db.execute(cl_stmt)).scalars().all()
         cluster_ids.update(grp_clusters)
 
     if not cluster_ids:
@@ -92,67 +93,42 @@ async def resolve_scope(
         )
 
     # 1. Devices in clusters
-    device_ids = set(
-        (
-            await db.execute(
-                select(ClusterDevice.device_id)
-                .join(Device, Device.id == ClusterDevice.device_id)
-                .where(
-                    ClusterDevice.cluster_id.in_(cluster_ids),
-                    Device.deleted_at.is_(None),
-                )
-            )
-        )
-        .scalars()
-        .all()
+    dev_stmt = (
+        select(ClusterDevice.device_id)
+        .join(Device, Device.id == ClusterDevice.device_id)
+        .where(ClusterDevice.cluster_id.in_(cluster_ids))
     )
+    if not include_deleted:
+        dev_stmt = dev_stmt.where(Device.deleted_at.is_(None))
+    device_ids = set((await db.execute(dev_stmt)).scalars().all())
 
     # 2. NICs on those devices
     nic_ids: set[int] = set()
     if device_ids:
-        nic_ids = set(
-            (
-                await db.execute(
-                    select(NIC.id).where(
-                        NIC.device_id.in_(device_ids),
-                        NIC.deleted_at.is_(None),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
+        nic_stmt = select(NIC.id).where(NIC.device_id.in_(device_ids))
+        if not include_deleted:
+            nic_stmt = nic_stmt.where(NIC.deleted_at.is_(None))
+        nic_ids = set((await db.execute(nic_stmt)).scalars().all())
 
     # 3. IPs bound to those NICs OR VIPs bound to those clusters/NICs OR endpoint IPs
     ip_ids: set[int] = set()
     if nic_ids:
-        ip_ids.update(
-            (
-                await db.execute(
-                    select(IPAddress.id).where(
-                        IPAddress.nic_id.in_(nic_ids),
-                        IPAddress.deleted_at.is_(None),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
+        ip_stmt = select(IPAddress.id).where(IPAddress.nic_id.in_(nic_ids))
+        if not include_deleted:
+            ip_stmt = ip_stmt.where(IPAddress.deleted_at.is_(None))
+        ip_ids.update((await db.execute(ip_stmt)).scalars().all())
 
     vip_conds = [and_(IPVIPBinding.target_type == "cluster", IPVIPBinding.target_id.in_(cluster_ids))]
     if nic_ids:
         vip_conds.append(and_(IPVIPBinding.target_type == "nic", IPVIPBinding.target_id.in_(nic_ids)))
-    ip_ids.update(
-        (
-            await db.execute(
-                select(IPVIPBinding.ip_id)
-                .join(IPAddress, IPAddress.id == IPVIPBinding.ip_id)
-                .where(or_(*vip_conds), IPAddress.deleted_at.is_(None))
-            )
-        )
-        .scalars()
-        .all()
+    vip_stmt = (
+        select(IPVIPBinding.ip_id)
+        .join(IPAddress, IPAddress.id == IPVIPBinding.ip_id)
+        .where(or_(*vip_conds))
     )
+    if not include_deleted:
+        vip_stmt = vip_stmt.where(IPAddress.deleted_at.is_(None))
+    ip_ids.update((await db.execute(vip_stmt)).scalars().all())
 
     ep_conds = [ServiceEndpoint.cluster_id.in_(cluster_ids)]
     if device_ids:
@@ -160,13 +136,14 @@ async def resolve_scope(
     if ip_ids:
         ep_conds.append(ServiceEndpoint.ip_id.in_(ip_ids))
 
-    ep_rows = (
-        await db.execute(
-            select(ServiceEndpoint.service_id, ServiceEndpoint.ip_id)
-            .join(Service, Service.id == ServiceEndpoint.service_id)
-            .where(or_(*ep_conds), Service.deleted_at.is_(None))
-        )
-    ).all()
+    ep_stmt = (
+        select(ServiceEndpoint.service_id, ServiceEndpoint.ip_id)
+        .join(Service, Service.id == ServiceEndpoint.service_id)
+        .where(or_(*ep_conds))
+    )
+    if not include_deleted:
+        ep_stmt = ep_stmt.where(Service.deleted_at.is_(None))
+    ep_rows = (await db.execute(ep_stmt)).all()
     service_ids: set[int] = set()
     for sid, ep_ip_id in ep_rows:
         service_ids.add(sid)
@@ -175,18 +152,17 @@ async def resolve_scope(
 
     # Also include VIPs bound directly to those services
     if service_ids:
-        svc_vips = (
-            await db.execute(
-                select(IPVIPBinding.ip_id)
-                .join(IPAddress, IPAddress.id == IPVIPBinding.ip_id)
-                .where(
-                    IPVIPBinding.target_type == "service",
-                    IPVIPBinding.target_id.in_(service_ids),
-                    IPAddress.deleted_at.is_(None),
-                )
+        svc_vip_stmt = (
+            select(IPVIPBinding.ip_id)
+            .join(IPAddress, IPAddress.id == IPVIPBinding.ip_id)
+            .where(
+                IPVIPBinding.target_type == "service",
+                IPVIPBinding.target_id.in_(service_ids),
             )
-        ).scalars().all()
-        ip_ids.update(svc_vips)
+        )
+        if not include_deleted:
+            svc_vip_stmt = svc_vip_stmt.where(IPAddress.deleted_at.is_(None))
+        ip_ids.update((await db.execute(svc_vip_stmt)).scalars().all())
 
     # 4. URLs linked to those services or entry IPs
     url_ids: set[int] = set()
@@ -196,34 +172,22 @@ async def resolve_scope(
     if ip_ids:
         url_conds.append(UrlEntry.entry_ip_id.in_(ip_ids))
     if url_conds:
-        url_ids = set(
-            (
-                await db.execute(
-                    select(UrlEntry.id).where(or_(*url_conds), UrlEntry.deleted_at.is_(None))
-                )
-            )
-            .scalars()
-            .all()
-        )
+        url_stmt = select(UrlEntry.id).where(or_(*url_conds))
+        if not include_deleted:
+            url_stmt = url_stmt.where(UrlEntry.deleted_at.is_(None))
+        url_ids = set((await db.execute(url_stmt)).scalars().all())
 
     # 5. Subnets containing any penetrated IPs
     subnet_ids: set[int] = set()
     if ip_ids:
-        subnet_ids = set(
-            (
-                await db.execute(
-                    select(IPAddress.subnet_id)
-                    .where(
-                        IPAddress.id.in_(ip_ids),
-                        IPAddress.subnet_id.is_not(None),
-                        IPAddress.deleted_at.is_(None),
-                    )
-                    .distinct()
-                )
-            )
-            .scalars()
-            .all()
+        sub_stmt = (
+            select(IPAddress.subnet_id)
+            .where(IPAddress.id.in_(ip_ids), IPAddress.subnet_id.is_not(None))
+            .distinct()
         )
+        if not include_deleted:
+            sub_stmt = sub_stmt.where(IPAddress.deleted_at.is_(None))
+        subnet_ids = set((await db.execute(sub_stmt)).scalars().all())
 
     return ResolvedScope(
         permission=permission,
@@ -258,21 +222,29 @@ def apply_scope_filter(
         if scope.allow_public:
             conds.append(group_col.is_(None))
 
-    id_sets = {
-        "cluster": scope.cluster_ids,
-        "device": scope.device_ids,
-        "nic": scope.nic_ids,
-        "ip": scope.ip_ids,
-        "service": scope.service_ids,
-        "url": scope.url_ids,
-        "subnet": scope.subnet_ids,
-    }
-    penetrated = id_sets.get(entity_type, set())
+    penetrated = scope.entity_id_sets().get(entity_type, set())
     if penetrated:
         conds.append(model.id.in_(penetrated))
 
     if not conds:
         return stmt.where(false())
+    return stmt.where(or_(*conds))
+
+
+def apply_audit_scope_filter(
+    stmt: Select[Any],
+    auth: AuthContext,
+    audit_scope: ResolvedScope,
+) -> Select[Any]:
+    """Apply actor ∪ Group ∪ Cluster-Penetrated filter to AuditLog queries."""
+    if audit_scope.unrestricted:
+        return stmt
+    conds: list[Any] = [AuditLog.actor_id == auth.user.id]
+    if audit_scope.group_ids:
+        conds.append(AuditLog.group_id.in_(audit_scope.group_ids))
+    for etype, ids in audit_scope.entity_id_sets().items():
+        if ids:
+            conds.append(and_(AuditLog.target_type == etype, AuditLog.target_id.in_(ids)))
     return stmt.where(or_(*conds))
 
 

@@ -105,7 +105,18 @@ async def _check_delete_blockers(db: AsyncSession, entity_type: str, obj: Any) -
                 )
             ).scalar_one()
         )
-        return f"仍有 {ep_cnt} 条服务端点" if ep_cnt else None
+        if ep_cnt:
+            return f"仍有 {ep_cnt} 条服务端点"
+        vip_cnt = int(
+            (
+                await db.execute(
+                    select(func.count())
+                    .select_from(IPVIPBinding)
+                    .where(IPVIPBinding.target_type == "cluster", IPVIPBinding.target_id == obj.id)
+                )
+            ).scalar_one()
+        )
+        return f"仍有 {vip_cnt} 条 VIP 绑定" if vip_cnt else None
 
     if entity_type == "device":
         nic_cnt = int(
@@ -124,7 +135,8 @@ async def _check_delete_blockers(db: AsyncSession, entity_type: str, obj: Any) -
                 await db.execute(
                     select(func.count())
                     .select_from(ServiceEndpoint)
-                    .where(ServiceEndpoint.device_id == obj.id)
+                    .join(Service, Service.id == ServiceEndpoint.service_id)
+                    .where(ServiceEndpoint.device_id == obj.id, Service.deleted_at.is_(None))
                 )
             ).scalar_one()
         )
@@ -151,7 +163,18 @@ async def _check_delete_blockers(db: AsyncSession, entity_type: str, obj: Any) -
                 )
             ).scalar_one()
         )
-        return f"仍有 {child_cnt} 张成员网卡" if child_cnt else None
+        if child_cnt:
+            return f"仍有 {child_cnt} 张成员网卡"
+        vip_cnt = int(
+            (
+                await db.execute(
+                    select(func.count())
+                    .select_from(IPVIPBinding)
+                    .where(IPVIPBinding.target_type == "nic", IPVIPBinding.target_id == obj.id)
+                )
+            ).scalar_one()
+        )
+        return f"仍有 {vip_cnt} 条 VIP 承载绑定" if vip_cnt else None
 
     if entity_type == "ip":
         if obj.nic_id is not None:
@@ -172,7 +195,8 @@ async def _check_delete_blockers(db: AsyncSession, entity_type: str, obj: Any) -
                 await db.execute(
                     select(func.count())
                     .select_from(ServiceEndpoint)
-                    .where(ServiceEndpoint.ip_id == obj.id)
+                    .join(Service, Service.id == ServiceEndpoint.service_id)
+                    .where(ServiceEndpoint.ip_id == obj.id, Service.deleted_at.is_(None))
                 )
             ).scalar_one()
         )

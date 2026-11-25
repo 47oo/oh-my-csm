@@ -172,26 +172,42 @@ async def create_url(
     auth: AuthContext = Depends(get_current_auth),
     db: AsyncSession = Depends(get_db),
 ) -> UrlOut:
+    target_svc: Service | None = None
+    if body.service_id is not None:
+        target_svc = (
+            await db.execute(
+                select(Service).where(Service.id == body.service_id, Service.deleted_at.is_(None))
+            )
+        ).scalar_one_or_none()
+        if target_svc is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="关联服务不存在")
+        await require_entity_permission(
+            db, auth, "service", target_svc.id, target_svc.group_id, "asset:read"
+        )
+
+    target_ip: IPAddress | None = None
+    if body.entry_ip_id is not None:
+        target_ip = (
+            await db.execute(
+                select(IPAddress).where(
+                    IPAddress.id == body.entry_ip_id, IPAddress.deleted_at.is_(None)
+                )
+            )
+        ).scalar_one_or_none()
+        if target_ip is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="入口 IP 不存在")
+        await require_entity_permission(
+            db, auth, "ip", target_ip.id, target_ip.group_id, "asset:read"
+        )
+
     if not auth.has_permission_in_group("asset:write", body.group_id):
         write_scope = await resolve_scope(db, auth, "asset:write")
-        allowed_via_svc = False
-        if body.service_id is not None:
-            svc = (
-                await db.execute(
-                    select(Service).where(Service.id == body.service_id, Service.deleted_at.is_(None))
-                )
-            ).scalar_one_or_none()
-            allowed_via_svc = svc is not None and write_scope.allows("service", svc.id, svc.group_id)
-        allowed_via_ip = False
-        if body.entry_ip_id is not None:
-            eip = (
-                await db.execute(
-                    select(IPAddress).where(
-                        IPAddress.id == body.entry_ip_id, IPAddress.deleted_at.is_(None)
-                    )
-                )
-            ).scalar_one_or_none()
-            allowed_via_ip = eip is not None and write_scope.allows("ip", eip.id, eip.group_id)
+        allowed_via_svc = target_svc is not None and write_scope.allows(
+            "service", target_svc.id, target_svc.group_id
+        )
+        allowed_via_ip = target_ip is not None and write_scope.allows(
+            "ip", target_ip.id, target_ip.group_id
+        )
         if not (allowed_via_svc or allowed_via_ip):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -553,11 +569,33 @@ async def update_url(
     if body.clear_service:
         entry.service_id = None
     elif body.service_id is not None:
+        if body.service_id != entry.service_id:
+            svc = (
+                await db.execute(
+                    select(Service).where(
+                        Service.id == body.service_id, Service.deleted_at.is_(None)
+                    )
+                )
+            ).scalar_one_or_none()
+            if svc is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="关联服务不存在")
+            await require_entity_permission(db, auth, "service", svc.id, svc.group_id, "asset:read")
         entry.service_id = body.service_id
 
     if body.clear_entry_ip:
         entry.entry_ip_id = None
     elif body.entry_ip_id is not None:
+        if body.entry_ip_id != entry.entry_ip_id:
+            eip = (
+                await db.execute(
+                    select(IPAddress).where(
+                        IPAddress.id == body.entry_ip_id, IPAddress.deleted_at.is_(None)
+                    )
+                )
+            ).scalar_one_or_none()
+            if eip is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="入口 IP 不存在")
+            await require_entity_permission(db, auth, "ip", eip.id, eip.group_id, "asset:read")
         entry.entry_ip_id = body.entry_ip_id
 
     for field in ("group_id", "access_type", "env", "status", "ssl_expires_at", "description", "extra_attrs"):

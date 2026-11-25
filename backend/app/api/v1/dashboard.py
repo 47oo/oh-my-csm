@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -23,7 +23,12 @@ from app.schemas.m3 import (
 )
 from app.schemas.system import AuditLogOut
 from app.services.assets import subnet_capacity
-from app.services.scope import ResolvedScope, apply_scope_filter, resolve_scope
+from app.services.scope import (
+    ResolvedScope,
+    apply_audit_scope_filter,
+    apply_scope_filter,
+    resolve_scope,
+)
 
 router = APIRouter(prefix="/dashboard", tags=["总览看板"])
 
@@ -232,18 +237,11 @@ async def get_dashboard_summary(
         DuplicateHostnameAlert(hostname=h, count=int(c)) for h, c in dup_rows
     ]
 
-    # 5. Recent scoped audits
+    # 5. Recent scoped audits (actor ∪ group ∪ cluster-penetrated)
     audit_stmt = select(AuditLog)
     if not auth.has_global_permission("audit:read"):
-        allowed_groups = {
-            gid for gid, perms in auth.group_permissions.items() if "audit:read" in perms
-        }
-        if allowed_groups:
-            audit_stmt = audit_stmt.where(
-                or_(AuditLog.actor_id == auth.user.id, AuditLog.group_id.in_(allowed_groups))
-            )
-        else:
-            audit_stmt = audit_stmt.where(AuditLog.actor_id == auth.user.id)
+        audit_scope = await resolve_scope(db, auth, "audit:read")
+        audit_stmt = apply_audit_scope_filter(audit_stmt, auth, audit_scope)
 
     recent_audits = list(
         (

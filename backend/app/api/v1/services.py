@@ -293,13 +293,29 @@ async def create_service(
     auth: AuthContext = Depends(get_current_auth),
     db: AsyncSession = Depends(get_db),
 ) -> ServiceOut:
-    if not auth.has_permission_in_group("asset:write", body.group_id):
-        write_scope = await resolve_scope(db, auth, "asset:write")
-        if not body.cluster_ids or not all(cid in write_scope.cluster_ids for cid in body.cluster_ids):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="仅集群授权用户新建服务时必须关联至少一个有写权限的集群",
+    write_scope = await resolve_scope(db, auth, "asset:write")
+    unique_cids = sorted(set(body.cluster_ids or []))
+    if unique_cids:
+        cl_rows = list(
+            (
+                await db.execute(
+                    select(Cluster).where(Cluster.id.in_(unique_cids), Cluster.deleted_at.is_(None))
+                )
             )
+            .scalars()
+            .all()
+        )
+        if len(cl_rows) != len(unique_cids):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="包含不存在的集群")
+        for cl in cl_rows:
+            await require_entity_permission(
+                db, auth, "cluster", cl.id, cl.group_id, "asset:write", scope=write_scope
+            )
+    if not auth.has_permission_in_group("asset:write", body.group_id) and not unique_cids:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="仅集群授权用户新建服务时必须关联至少一个有写权限的集群",
+        )
 
     name = body.name.strip()
     exists = (
@@ -565,6 +581,43 @@ async def delete_service(
     return MessageResponse(message=f"服务 '{svc.name}' 已移入回收站")
 
 
+async def _validate_endpoint_targets(
+    db: AsyncSession,
+    auth: AuthContext,
+    *,
+    cluster_id: int | None,
+    device_id: int | None,
+    ip_id: int | None,
+) -> None:
+    if cluster_id is not None:
+        cl = (
+            await db.execute(
+                select(Cluster).where(Cluster.id == cluster_id, Cluster.deleted_at.is_(None))
+            )
+        ).scalar_one_or_none()
+        if cl is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="关联集群不存在")
+        await require_entity_permission(db, auth, "cluster", cl.id, cl.group_id, "asset:write")
+    if device_id is not None:
+        dev = (
+            await db.execute(
+                select(Device).where(Device.id == device_id, Device.deleted_at.is_(None))
+            )
+        ).scalar_one_or_none()
+        if dev is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="关联设备不存在")
+        await require_entity_permission(db, auth, "device", dev.id, dev.group_id, "asset:read")
+    if ip_id is not None:
+        ip_obj = (
+            await db.execute(
+                select(IPAddress).where(IPAddress.id == ip_id, IPAddress.deleted_at.is_(None))
+            )
+        ).scalar_one_or_none()
+        if ip_obj is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="监听 IP 不存在")
+        await require_entity_permission(db, auth, "ip", ip_obj.id, ip_obj.group_id, "asset:read")
+
+
 @router.post("/{service_id}/endpoints", response_model=ServiceEndpointOut, status_code=status.HTTP_201_CREATED)
 async def add_service_endpoint(
     service_id: int,
@@ -580,6 +633,9 @@ async def add_service_endpoint(
     if svc is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="服务不存在")
     await require_entity_permission(db, auth, "service", svc.id, svc.group_id, "asset:write")
+    await _validate_endpoint_targets(
+        db, auth, cluster_id=body.cluster_id, device_id=body.device_id, ip_id=body.ip_id
+    )
 
     ep = ServiceEndpoint(
         service_id=svc.id,
@@ -643,6 +699,14 @@ async def update_service_endpoint(
     ).scalar_one_or_none()
     if ep is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="服务端点不存在")
+
+    await _validate_endpoint_targets(
+        db,
+        auth,
+        cluster_id=body.cluster_id if body.cluster_id != ep.cluster_id else None,
+        device_id=body.device_id if body.device_id != ep.device_id else None,
+        ip_id=body.ip_id if body.ip_id != ep.ip_id else None,
+    )
 
     for field in (
         "cluster_id",

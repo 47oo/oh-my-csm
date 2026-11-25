@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -268,6 +269,24 @@ async def create_ip(
                 select(Device).where(Device.id == nic.device_id, Device.deleted_at.is_(None))
             )
         ).scalar_one_or_none()
+        if nic_device is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="网卡所属设备不存在")
+        await require_entity_permission(
+            db, auth, "device", nic_device.id, nic_device.group_id, "asset:write"
+        )
+
+    target_cluster: Cluster | None = None
+    if body.cluster_id is not None:
+        target_cluster = (
+            await db.execute(
+                select(Cluster).where(Cluster.id == body.cluster_id, Cluster.deleted_at.is_(None))
+            )
+        ).scalar_one_or_none()
+        if target_cluster is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="关联集群不存在")
+        await require_entity_permission(
+            db, auth, "cluster", target_cluster.id, target_cluster.group_id, "asset:write"
+        )
 
     subnet: Subnet | None = None
     if body.subnet_id is not None:
@@ -317,72 +336,91 @@ async def create_ip(
                 detail="仅集群授权用户录入 IP 时必须绑定到有写权限的集群网卡或指定集群 VIP",
             )
 
-    reusable_ip: IPAddress | None = None
-    if auto_allocated:
-        assert subnet is not None
-        zone_ip_map = await get_zone_subnet_ip_map(db, subnet)
-        occupied = {ip for ip, obj in zone_ip_map.items() if obj.status != "free"}
-        next_ip = find_next_free_ip(subnet, occupied)
-        if next_ip is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"网段 {subnet.cidr} 已无可用空闲 IP，请更换网段或释放空闲地址",
-            )
-        ip_str = next_ip
-        reusable_ip = zone_ip_map.get(ip_str)
-    else:
-        ip_str = normalize_ip(raw_ip)
-        if subnet is not None:
-            validate_ip_in_subnet(ip_str, str(subnet.cidr))
-        else:
-            subnet = await match_subnet_for_ip(db, zone_id, ip_str)
-
-        exists = (
-            await db.execute(
-                select(IPAddress.id).where(
-                    IPAddress.network_zone_id == zone_id,
-                    IPAddress.ip_address == ip_str,
-                    IPAddress.deleted_at.is_(None),
+    ip_obj: IPAddress | None = None
+    ip_str = ""
+    reused_free = False
+    max_attempts = 5 if auto_allocated else 1
+    for attempt in range(max_attempts):
+        reusable_ip: IPAddress | None = None
+        if auto_allocated:
+            assert subnet is not None
+            zone_ip_map = await get_zone_subnet_ip_map(db, subnet)
+            occupied = {ip for ip, obj in zone_ip_map.items() if obj.status != "free"}
+            next_ip = find_next_free_ip(subnet, occupied)
+            if next_ip is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"网段 {subnet.cidr} 已无可用空闲 IP，请更换网段或释放空闲地址",
                 )
-            )
-        ).scalar_one_or_none()
-        if exists is not None:
+            ip_str = next_ip
+            reusable_ip = zone_ip_map.get(ip_str)
+        else:
+            ip_str = normalize_ip(raw_ip)
+            if subnet is not None:
+                validate_ip_in_subnet(ip_str, str(subnet.cidr))
+            else:
+                subnet = await match_subnet_for_ip(db, zone_id, ip_str)
+
+            exists = (
+                await db.execute(
+                    select(IPAddress.id).where(
+                        IPAddress.network_zone_id == zone_id,
+                        IPAddress.ip_address == ip_str,
+                        IPAddress.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if exists is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"该网络域内 IP {ip_str} 已存在，请检查冲突",
+                )
+
+        sp = await db.begin_nested()
+        try:
+            reused_free = reusable_ip is not None
+            if reusable_ip is not None:
+                reusable_ip.subnet_id = subnet.id if subnet else None
+                reusable_ip.nic_id = nic.id if nic else None
+                reusable_ip.group_id = group_id
+                reusable_ip.ip_type = body.ip_type
+                reusable_ip.is_primary = body.is_primary
+                reusable_ip.status = body.status
+                reusable_ip.usage = body.usage
+                reusable_ip.description = body.description
+                reusable_ip.extra_attrs = body.extra_attrs
+                reusable_ip.updated_by = auth.user.id
+                ip_obj = reusable_ip
+            else:
+                ip_obj = IPAddress(
+                    network_zone_id=zone_id,
+                    subnet_id=subnet.id if subnet else None,
+                    nic_id=nic.id if nic else None,
+                    group_id=group_id,
+                    ip_address=ip_str,
+                    ip_type=body.ip_type,
+                    is_primary=body.is_primary,
+                    status=body.status,
+                    usage=body.usage,
+                    description=body.description,
+                    extra_attrs=body.extra_attrs,
+                    created_by=auth.user.id,
+                    updated_by=auth.user.id,
+                )
+                db.add(ip_obj)
+            await db.flush()
+            await sp.commit()
+            break
+        except IntegrityError as exc:
+            await sp.rollback()
+            if auto_allocated and attempt + 1 < max_attempts:
+                continue
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"该网络域内 IP {ip_str} 已存在，请检查冲突",
-            )
+                detail=f"该网络域内 IP {ip_str} 并发冲突，请重试",
+            ) from exc
 
-    reused_free = reusable_ip is not None
-    if reusable_ip is not None:
-        reusable_ip.subnet_id = subnet.id if subnet else None
-        reusable_ip.nic_id = nic.id if nic else None
-        reusable_ip.group_id = group_id
-        reusable_ip.ip_type = body.ip_type
-        reusable_ip.is_primary = body.is_primary
-        reusable_ip.status = body.status
-        reusable_ip.usage = body.usage
-        reusable_ip.description = body.description
-        reusable_ip.extra_attrs = body.extra_attrs
-        reusable_ip.updated_by = auth.user.id
-        ip_obj = reusable_ip
-    else:
-        ip_obj = IPAddress(
-            network_zone_id=zone_id,
-            subnet_id=subnet.id if subnet else None,
-            nic_id=nic.id if nic else None,
-            group_id=group_id,
-            ip_address=ip_str,
-            ip_type=body.ip_type,
-            is_primary=body.is_primary,
-            status=body.status,
-            usage=body.usage,
-            description=body.description,
-            extra_attrs=body.extra_attrs,
-            created_by=auth.user.id,
-            updated_by=auth.user.id,
-        )
-        db.add(ip_obj)
-    await db.flush()
+    assert ip_obj is not None
     if body.cluster_id is not None:
         existing_binding = (
             await db.execute(
@@ -615,6 +653,8 @@ async def update_ip(
         ).scalar_one_or_none()
         if sub is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="所属网段不存在")
+        if body.subnet_id != ip_obj.subnet_id:
+            await require_entity_permission(db, auth, "subnet", sub.id, sub.group_id, "asset:read")
         if sub.network_zone_id != ip_obj.network_zone_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="网段与 IP 不在同一个网络域")
         validate_ip_in_subnet(ip_str, str(sub.cidr))
@@ -629,6 +669,17 @@ async def update_ip(
         ).scalar_one_or_none()
         if nic is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="绑定的网卡不存在")
+        if body.nic_id != ip_obj.nic_id:
+            nic_dev = (
+                await db.execute(
+                    select(Device).where(Device.id == nic.device_id, Device.deleted_at.is_(None))
+                )
+            ).scalar_one_or_none()
+            if nic_dev is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="网卡所属设备不存在")
+            await require_entity_permission(
+                db, auth, "device", nic_dev.id, nic_dev.group_id, "asset:write"
+            )
         ip_obj.nic_id = nic.id
 
     for field in ("group_id", "ip_type", "is_primary", "status", "usage", "description", "extra_attrs"):
@@ -755,12 +806,12 @@ async def add_vip_binding(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP 不存在")
     await require_entity_permission(db, auth, "ip", ip_obj.id, ip_obj.group_id, "asset:write")
 
-    # Verify target exists
+    # Verify target exists and user holds write permission on it
     model_map = {"nic": NIC, "cluster": Cluster, "service": Service}
     target_model = model_map[body.target_type]
     target = (
         await db.execute(
-            select(target_model.id).where(
+            select(target_model).where(
                 target_model.id == body.target_id,
                 target_model.deleted_at.is_(None),
             )
@@ -768,6 +819,21 @@ async def add_vip_binding(
     ).scalar_one_or_none()
     if target is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="VIP 绑定的目标对象不存在")
+    if body.target_type == "nic":
+        nic_dev = (
+            await db.execute(
+                select(Device).where(Device.id == target.device_id, Device.deleted_at.is_(None))
+            )
+        ).scalar_one_or_none()
+        if nic_dev is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="目标网卡所属设备不存在")
+        await require_entity_permission(
+            db, auth, "device", nic_dev.id, nic_dev.group_id, "asset:write"
+        )
+    else:
+        await require_entity_permission(
+            db, auth, body.target_type, target.id, target.group_id, "asset:write"
+        )
 
     exists = (
         await db.execute(

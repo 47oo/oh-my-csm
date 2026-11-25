@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -11,7 +11,7 @@ from app.core.permissions import AuthContext, get_current_auth
 from app.models.audit import AuditLog
 from app.schemas.common import PageResponse
 from app.schemas.system import AuditLogOut
-from app.services.scope import resolve_scope
+from app.services.scope import apply_audit_scope_filter, resolve_scope
 
 router = APIRouter(prefix="/audit-logs", tags=["审计日志"])
 
@@ -31,21 +31,7 @@ async def list_audit_logs(
 
     if not auth.has_global_permission("audit:read"):
         audit_scope = await resolve_scope(db, auth, "audit:read")
-        conds = [AuditLog.actor_id == auth.user.id]
-        if audit_scope.group_ids:
-            conds.append(AuditLog.group_id.in_(audit_scope.group_ids))
-        for etype, ids in (
-            ("cluster", audit_scope.cluster_ids),
-            ("device", audit_scope.device_ids),
-            ("nic", audit_scope.nic_ids),
-            ("ip", audit_scope.ip_ids),
-            ("service", audit_scope.service_ids),
-            ("url", audit_scope.url_ids),
-            ("subnet", audit_scope.subnet_ids),
-        ):
-            if ids:
-                conds.append(and_(AuditLog.target_type == etype, AuditLog.target_id.in_(ids)))
-        base = base.where(or_(*conds))
+        base = apply_audit_scope_filter(base, auth, audit_scope)
 
     if action:
         base = base.where(AuditLog.action == action)

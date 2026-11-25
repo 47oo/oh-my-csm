@@ -25,7 +25,7 @@ from app.schemas.common import MessageResponse
 from app.schemas.m3 import RecycleBinItemOut
 from app.services.assets import format_ip_str, load_group_names
 from app.services.audit import record_audit
-from app.services.scope import resolve_scope
+from app.services.scope import ResolvedScope, resolve_scope
 
 router = APIRouter(prefix="/recycle-bin", tags=["回收站"])
 
@@ -167,6 +167,22 @@ async def _check_restore_conflict(db: AsyncSession, entity_type: str, obj: Any) 
     return None
 
 
+def _can_restore_item(
+    auth: AuthContext,
+    restore_scope: ResolvedScope,
+    entity_type: str,
+    obj: Any,
+    gid: int | None,
+) -> bool:
+    if auth.is_superadmin or (gid is not None and auth.has_permission_in_group("recycle_bin:restore", gid)):
+        return True
+    if entity_type in {"cluster", "device", "nic", "ip", "service", "url", "subnet"}:
+        return restore_scope.allows(entity_type, obj.id, gid)
+    if entity_type == "credential":
+        return restore_scope.allows(obj.target_type, obj.target_id, gid)
+    return False
+
+
 @router.get("", response_model=list[RecycleBinItemOut])
 async def list_recycle_bin(
     entity_type: str | None = Query(default=None),
@@ -181,7 +197,7 @@ async def list_recycle_bin(
 
     types_to_scan = [entity_type] if entity_type else list(RECYCLE_MODELS.keys())
     raw_items: list[tuple[str, Any, int | None]] = []
-    restore_scope = await resolve_scope(db, auth, "recycle_bin:restore")
+    restore_scope = await resolve_scope(db, auth, "recycle_bin:restore", include_deleted=True)
 
     for etype in types_to_scan:
         model = RECYCLE_MODELS[etype]
@@ -199,14 +215,7 @@ async def list_recycle_bin(
         )
         for obj in rows:
             gid = await _item_group_id(db, etype, obj)
-            allowed = auth.is_superadmin or (
-                gid is not None and auth.has_permission_in_group("recycle_bin:restore", gid)
-            )
-            if not allowed and etype in {"cluster", "device", "nic", "ip", "service", "url", "subnet"}:
-                allowed = restore_scope.allows(etype, obj.id, gid)
-            if not allowed and etype == "credential":
-                allowed = restore_scope.allows(obj.target_type, obj.target_id, gid)
-            if allowed:
+            if _can_restore_item(auth, restore_scope, etype, obj, gid):
                 raw_items.append((etype, obj, gid))
 
     gnames = await load_group_names(db, {gid for _, _, gid in raw_items if gid is not None})
@@ -247,18 +256,12 @@ async def restore_item(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="回收站中未找到该记录")
 
     gid = await _item_group_id(db, entity_type, obj)
-    if not auth.has_permission_in_group("recycle_bin:restore", gid):
-        restore_scope = await resolve_scope(db, auth, "recycle_bin:restore")
-        allowed = False
-        if entity_type in {"cluster", "device", "nic", "ip", "service", "url", "subnet"}:
-            allowed = restore_scope.allows(entity_type, obj.id, gid)
-        elif entity_type == "credential":
-            allowed = restore_scope.allows(obj.target_type, obj.target_id, gid)
-        if not allowed:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="缺少恢复该记录的权限: recycle_bin:restore",
-            )
+    restore_scope = await resolve_scope(db, auth, "recycle_bin:restore", include_deleted=True)
+    if not _can_restore_item(auth, restore_scope, entity_type, obj, gid):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="缺少恢复该记录的权限: recycle_bin:restore",
+        )
 
     conflict = await _check_restore_conflict(db, entity_type, obj)
     if conflict:

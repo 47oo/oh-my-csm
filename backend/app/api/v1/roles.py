@@ -13,7 +13,7 @@ from app.core.permissions import (
     AuthContext,
     get_current_auth,
 )
-from app.models.auth import Role, UserGroupRole
+from app.models.auth import ClusterACL, Role, UserGroupRole
 from app.schemas.common import MessageResponse, PermissionItem
 from app.schemas.system import RoleCreate, RoleOut, RoleUpdate
 from app.services.audit import record_audit
@@ -139,17 +139,25 @@ async def delete_role(
     if role.is_builtin:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="内置角色不可删除")
 
-    used_count = int(
+    used_group_count = int(
         (
             await db.execute(
                 select(func.count()).select_from(UserGroupRole).where(UserGroupRole.role_id == role.id)
             )
         ).scalar_one()
     )
+    used_cluster_count = int(
+        (
+            await db.execute(
+                select(func.count()).select_from(ClusterACL).where(ClusterACL.role_id == role.id)
+            )
+        ).scalar_one()
+    )
+    used_count = used_group_count + used_cluster_count
     if used_count > 0:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"该角色仍被 {used_count} 条用户授权引用，请先解除绑定",
+            detail=f"该角色仍被 {used_count} 条用户授权引用（分组 {used_group_count} / 集群 {used_cluster_count}），请先解除绑定",
         )
 
     await db.delete(role)

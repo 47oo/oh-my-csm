@@ -508,6 +508,7 @@ async def attach_device_to_cluster(
     ).scalar_one_or_none()
     if device is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="设备不存在")
+    await require_entity_permission(db, auth, "device", device.id, device.group_id, "asset:write")
 
     existing = (
         await db.execute(
