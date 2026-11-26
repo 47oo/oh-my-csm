@@ -200,6 +200,8 @@ async def create_url(
             db, auth, "ip", target_ip.id, target_ip.group_id, "asset:read"
         )
 
+    if body.group_id is not None:
+        auth.require_group_permission("asset:write", body.group_id)
     if not auth.has_permission_in_group("asset:write", body.group_id):
         write_scope = await resolve_scope(db, auth, "asset:write")
         allowed_via_svc = target_svc is not None and write_scope.allows(
@@ -545,6 +547,7 @@ async def update_url(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="URL 记录不存在")
     await require_entity_permission(db, auth, "url", entry.id, entry.group_id, "asset:write")
     if body.group_id is not None and body.group_id != entry.group_id:
+        auth.require_group_permission("asset:write", entry.group_id)
         auth.require_group_permission("asset:write", body.group_id)
 
     before = {

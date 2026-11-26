@@ -311,6 +311,8 @@ async def create_service(
             await require_entity_permission(
                 db, auth, "cluster", cl.id, cl.group_id, "asset:write", scope=write_scope
             )
+    if body.group_id is not None:
+        auth.require_group_permission("asset:write", body.group_id)
     if not auth.has_permission_in_group("asset:write", body.group_id) and not unique_cids:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -465,7 +467,28 @@ async def update_service(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="服务不存在")
     await require_entity_permission(db, auth, "service", svc.id, svc.group_id, "asset:write")
     if body.group_id is not None and body.group_id != svc.group_id:
+        auth.require_group_permission("asset:write", svc.group_id)
         auth.require_group_permission("asset:write", body.group_id)
+
+    new_name = body.name.strip() if body.name is not None else svc.name
+    new_env = body.env if body.env is not None else svc.env
+    if new_name != svc.name or new_env != svc.env:
+        env_cond = Service.env.is_(None) if new_env is None else (Service.env == new_env)
+        dup = (
+            await db.execute(
+                select(Service.id).where(
+                    Service.id != svc.id,
+                    Service.name == new_name,
+                    env_cond,
+                    Service.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if dup is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"同环境下服务 '{new_name}' 已存在",
+            )
 
     before = {
         "name": svc.name,
@@ -547,22 +570,10 @@ async def delete_service(
     if url_cnt:
         blockers.append(f"{url_cnt} 条关联 URL")
 
-    ep_cnt = int(
-        (
-            await db.execute(
-                select(func.count())
-                .select_from(ServiceEndpoint)
-                .where(ServiceEndpoint.service_id == svc.id)
-            )
-        ).scalar_one()
-    )
-    if ep_cnt:
-        blockers.append(f"{ep_cnt} 条运行端点")
-
     if blockers:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"该服务仍有关联项（{'、'.join(blockers)}），请先解绑或清理端点后再删除",
+            detail=f"该服务仍有关联项（{'、'.join(blockers)}），请先解绑后再删除",
         )
 
     svc.deleted_at = utc_now()
@@ -700,6 +711,12 @@ async def update_service_endpoint(
     if ep is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="服务端点不存在")
 
+    if body.cluster_id is not None and ep.cluster_id is not None and body.cluster_id != ep.cluster_id:
+        old_cl = await db.get(Cluster, ep.cluster_id)
+        await require_entity_permission(
+            db, auth, "cluster", ep.cluster_id, old_cl.group_id if old_cl else None, "asset:write"
+        )
+
     await _validate_endpoint_targets(
         db,
         auth,
@@ -753,6 +770,11 @@ async def delete_service_endpoint(
     ).scalar_one_or_none()
     if ep is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="服务端点不存在")
+    if ep.cluster_id is not None:
+        old_cl = await db.get(Cluster, ep.cluster_id)
+        await require_entity_permission(
+            db, auth, "cluster", ep.cluster_id, old_cl.group_id if old_cl else None, "asset:write"
+        )
 
     await db.delete(ep)
     await db.flush()

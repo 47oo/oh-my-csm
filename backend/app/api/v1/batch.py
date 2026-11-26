@@ -112,7 +112,12 @@ async def _check_delete_blockers(db: AsyncSession, entity_type: str, obj: Any) -
                 await db.execute(
                     select(func.count())
                     .select_from(IPVIPBinding)
-                    .where(IPVIPBinding.target_type == "cluster", IPVIPBinding.target_id == obj.id)
+                    .join(IPAddress, IPAddress.id == IPVIPBinding.ip_id)
+                    .where(
+                        IPVIPBinding.target_type == "cluster",
+                        IPVIPBinding.target_id == obj.id,
+                        IPAddress.deleted_at.is_(None),
+                    )
                 )
             ).scalar_one()
         )
@@ -170,7 +175,12 @@ async def _check_delete_blockers(db: AsyncSession, entity_type: str, obj: Any) -
                 await db.execute(
                     select(func.count())
                     .select_from(IPVIPBinding)
-                    .where(IPVIPBinding.target_type == "nic", IPVIPBinding.target_id == obj.id)
+                    .join(IPAddress, IPAddress.id == IPVIPBinding.ip_id)
+                    .where(
+                        IPVIPBinding.target_type == "nic",
+                        IPVIPBinding.target_id == obj.id,
+                        IPAddress.deleted_at.is_(None),
+                    )
                 )
             ).scalar_one()
         )
@@ -223,18 +233,7 @@ async def _check_delete_blockers(db: AsyncSession, entity_type: str, obj: Any) -
                 )
             ).scalar_one()
         )
-        if url_cnt:
-            return f"仍有 {url_cnt} 条关联 URL"
-        ep_cnt = int(
-            (
-                await db.execute(
-                    select(func.count())
-                    .select_from(ServiceEndpoint)
-                    .where(ServiceEndpoint.service_id == obj.id)
-                )
-            ).scalar_one()
-        )
-        return f"仍有 {ep_cnt} 条运行端点" if ep_cnt else None
+        return f"仍有 {url_cnt} 条关联 URL" if url_cnt else None
 
     return None
 
@@ -356,6 +355,18 @@ async def execute_batch_operation(
             succeeded.append(obj.id)
 
         elif body.action == "move_group":
+            if body.group_id != row_gid and not (
+                auth.has_permission_in_group("asset:write", row_gid)
+                and auth.has_permission_in_group("asset:write", body.group_id)
+            ):
+                failed.append(
+                    BatchFailureItem(
+                        id=item_id,
+                        label=label,
+                        reason="跨分组迁移需同时具备源分组与目标分组的 asset:write 权限",
+                    )
+                )
+                continue
             before = {"group_id": row_gid}
             obj.group_id = body.group_id
             obj.updated_by = auth.user.id

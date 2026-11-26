@@ -208,7 +208,7 @@ async function handleSave() {
         network_zone_id: form.network_zone_id,
         subnet_id: form.subnet_id,
         nic_id: form.nic_id,
-        cluster_id: form.ip_type === 'vip' ? form.cluster_id : null,
+        cluster_id: !form.nic_id || form.ip_type === 'vip' ? form.cluster_id : null,
         group_id: form.group_id,
         ip_type: form.ip_type,
         is_primary: form.is_primary,
@@ -228,7 +228,7 @@ async function handleSave() {
 
 async function handleDelete(id: number) {
   try {
-    await ipApi.remove(id)
+    await ipApi.remove(id, true)
     message.success('IP 已移入回收站')
     await loadData()
   } catch (err) {
@@ -449,12 +449,12 @@ onMounted(loadData)
             ]"
           />
         </n-form-item>
-        <n-form-item v-if="!editing && form.ip_type === 'vip'" label="归属集群">
+        <n-form-item v-if="!editing && (form.ip_type === 'vip' || !form.nic_id)" label="归属集群">
           <n-select
             v-model:value="form.cluster_id"
             clearable
             filterable
-            placeholder="VIP 可直接绑定到目标集群"
+            placeholder="未绑网卡或录入 VIP 时可绑定到目标集群"
             :options="clusters.map((c) => ({ label: c.name, value: c.id }))"
           />
         </n-form-item>

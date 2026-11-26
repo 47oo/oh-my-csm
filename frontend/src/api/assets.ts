@@ -128,6 +128,7 @@ export interface DeviceItem {
   description: string | null
   extra_attrs: Record<string, unknown>
   tags: TagBrief[]
+  cluster_ids: number[]
   cluster_names: string[]
   nic_count: number
   primary_ips: string[]
@@ -360,7 +361,8 @@ export const ipApi = {
   detail: (id: number) => api.get<IpDetail>(`/ips/${id}`),
   create: (payload: Record<string, unknown>) => api.post<IpItem>('/ips', payload),
   update: (id: number, payload: Record<string, unknown>) => api.put<IpItem>(`/ips/${id}`, payload),
-  remove: (id: number) => api.delete(`/ips/${id}`),
+  remove: (id: number, forceUnbind = false) =>
+    api.delete(`/ips/${id}`, { params: { force_unbind: forceUnbind } }),
   addVipBinding: (ipId: number, payload: { target_type: string; target_id: number; role?: string | null; description?: string | null }) =>
     api.post<VipBindingItem>(`/ips/${ipId}/vip-bindings`, payload),
   removeVipBinding: (ipId: number, bindingId: number) =>

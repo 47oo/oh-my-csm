@@ -254,6 +254,7 @@ class DeviceOut(BaseModel):
     description: str | None = None
     extra_attrs: dict[str, Any] = Field(default_factory=dict)
     tags: list[TagBrief] = Field(default_factory=list)
+    cluster_ids: list[int] = Field(default_factory=list)
     cluster_names: list[str] = Field(default_factory=list)
     nic_count: int = 0
     primary_ips: list[str] = Field(default_factory=list)

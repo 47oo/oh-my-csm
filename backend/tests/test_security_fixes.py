@@ -364,3 +364,200 @@ async def test_security_cross_boundary_attachment_excel_recycle_and_role_guards(
     assert batch_del["succeeded_ids"] == []
     assert len(batch_del["failed"]) == 1
     assert "VIP" in batch_del["failed"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_round2_reverse_penetration_cross_group_inject_and_recycle_deadlock(
+    client: AsyncClient, auth_headers
+):
+    admin_tok = await _get_admin_token(client)
+    admin_hdr = auth_headers(admin_tok)
+
+    roles = (await client.get("/api/v1/roles", headers=admin_hdr)).json()
+    role_by_code = {r["code"]: r["id"] for r in roles}
+
+    grp_other = (
+        await client.post("/api/v1/groups", json={"name": "其他团队", "code": "other-team"}, headers=admin_hdr)
+    ).json()
+    sub_shared = (
+        await client.post(
+            "/api/v1/subnets",
+            json={"name": "共享网段", "cidr": "10.240.1.0/24", "gateway": "10.240.1.1"},
+            headers=admin_hdr,
+        )
+    ).json()
+    cl_a1 = (
+        await client.post("/api/v1/clusters", json={"name": "R2-Cluster-1", "env": "prod"}, headers=admin_hdr)
+    ).json()
+    cl_a2 = (
+        await client.post("/api/v1/clusters", json={"name": "R2-Cluster-2", "env": "prod"}, headers=admin_hdr)
+    ).json()
+
+    # Public unassigned IP (readable when allow_public_assets=True, NEVER writable!)
+    pub_ip = (
+        await client.post(
+            "/api/v1/ips",
+            json={"ip_address": "10.240.1.200", "usage": "public-readonly-ip"},
+            headers=admin_hdr,
+        )
+    ).json()
+
+    # Create cluster admin on cl_a1 & cl_a2 with allow_public_assets=True (and NO group perms)
+    await client.post(
+        "/api/v1/users",
+        json={
+            "username": "r2_cl_admin",
+            "display_name": "R2 Cluster Admin",
+            "password": "R2Password123",
+            "must_change_password": False,
+            "allow_public_assets": True,
+            "assignments": [],
+            "cluster_assignments": [
+                {"cluster_id": cl_a1["id"], "role_id": role_by_code["group_admin"]},
+                {"cluster_id": cl_a2["id"], "role_id": role_by_code["group_admin"]},
+            ],
+        },
+        headers=admin_hdr,
+    )
+    u_tok = (
+        await client.post("/api/v1/auth/login", json={"username": "r2_cl_admin", "password": "R2Password123"})
+    ).json()["access_token"]
+    u_hdr = auth_headers(u_tok)
+
+    # 1. Cross-group injection on create must be blocked (403)
+    assert (
+        await client.post(
+            "/api/v1/devices",
+            json={"hostname": "inject-dev", "group_id": grp_other["id"], "cluster_ids": [cl_a1["id"]]},
+            headers=u_hdr,
+        )
+    ).status_code == 403
+
+    # Legitimate cluster device + NIC + IP + Service creation
+    dev = (
+        await client.post(
+            "/api/v1/devices",
+            json={"hostname": "r2-dev-01", "cluster_ids": [cl_a1["id"]]},
+            headers=u_hdr,
+        )
+    ).json()
+    assert dev["cluster_ids"] == [cl_a1["id"]]
+    # Set node_role="master" on cl_a1, then add cl_a2 via PUT /devices -> node_role must be preserved!
+    await client.post(
+        f"/api/v1/clusters/{cl_a1['id']}/devices",
+        json={"device_id": dev["id"], "node_role": "master"},
+        headers=u_hdr,
+    )
+    upd_dev = await client.put(
+        f"/api/v1/devices/{dev['id']}",
+        json={"cluster_ids": [cl_a1["id"], cl_a2["id"]]},
+        headers=u_hdr,
+    )
+    assert upd_dev.status_code == 200
+    assert set(upd_dev.json()["cluster_ids"]) == {cl_a1["id"], cl_a2["id"]}
+    cl1_detail = (await client.get(f"/api/v1/clusters/{cl_a1['id']}", headers=u_hdr)).json()
+    assert any(d["id"] == dev["id"] and d["role"] == "master" for d in cl1_detail["devices"])
+
+    # Cannot hijack device into grp_other via PUT or batch move_group
+    assert (
+        await client.put(f"/api/v1/devices/{dev['id']}", json={"group_id": grp_other["id"]}, headers=u_hdr)
+    ).status_code == 403
+    assert (
+        await client.post(
+            "/api/v1/batch/devices",
+            json={"ids": [dev["id"]], "action": "move_group", "group_id": grp_other["id"]},
+            headers=u_hdr,
+        )
+    ).status_code == 403
+
+    # Even if user has ops_editor on their OWN group, they cannot steal a non-owned cluster device into it!
+    grp_own = (
+        await client.post("/api/v1/groups", json={"name": "自有组", "code": "own-team"}, headers=admin_hdr)
+    ).json()
+    await client.post(
+        f"/api/v1/groups/{grp_own['id']}/members",
+        json={
+            "user_id": (await client.get("/api/v1/auth/me", headers=u_hdr)).json()["id"],
+            "role_id": role_by_code["ops_editor"],
+        },
+        headers=admin_hdr,
+    )
+    assert (
+        await client.put(f"/api/v1/devices/{dev['id']}", json={"group_id": grp_own["id"]}, headers=u_hdr)
+    ).status_code == 403
+    batch_steal = (
+        await client.post(
+            "/api/v1/batch/devices",
+            json={"ids": [dev["id"]], "action": "move_group", "group_id": grp_own["id"]},
+            headers=u_hdr,
+        )
+    ).json()
+    assert batch_steal["succeeded_ids"] == []
+    assert len(batch_steal["failed"]) == 1
+
+    # 2. Endpoint reverse-penetration blocked: attaching pub_ip to a cl_a1 service must NOT grant write/delete on pub_ip!
+    svc = (
+        await client.post(
+            "/api/v1/services",
+            json={"name": "r2-svc", "cluster_ids": [cl_a1["id"]]},
+            headers=u_hdr,
+        )
+    ).json()
+    ep_res = await client.post(
+        f"/api/v1/services/{svc['id']}/endpoints",
+        json={"cluster_id": cl_a1["id"], "ip_id": pub_ip["id"], "port": 9000},
+        headers=u_hdr,
+    )
+    assert ep_res.status_code == 201
+    assert (
+        await client.put(f"/api/v1/ips/{pub_ip['id']}", json={"usage": "PWNED"}, headers=u_hdr)
+    ).status_code == 403
+    assert (await client.delete(f"/api/v1/ips/{pub_ip['id']}", headers=u_hdr)).status_code == 403
+
+    # 3. Shared subnet batch tamper blocked
+    nic = (
+        await client.post(
+            "/api/v1/nics",
+            json={"device_id": dev["id"], "name": "eth0"},
+            headers=u_hdr,
+        )
+    ).json()
+    host_ip = (
+        await client.post(
+            "/api/v1/ips",
+            json={"ip_address": "10.240.1.10", "nic_id": nic["id"]},
+            headers=u_hdr,
+        )
+    ).json()
+    sub_batch = (
+        await client.post(
+            "/api/v1/batch/subnets",
+            json={"ids": [sub_shared["id"]], "action": "update_status", "status": "retired"},
+            headers=u_hdr,
+        )
+    ).json()
+    assert sub_batch["succeeded_ids"] == []
+
+    # 4. Cluster-only admin can soft-delete & restore BOTH service (with endpoints intact) AND bound IP (force_unbind=true)!
+    assert (await client.delete(f"/api/v1/services/{svc['id']}", headers=u_hdr)).status_code == 200
+    assert (
+        await client.delete(f"/api/v1/ips/{host_ip['id']}", params={"force_unbind": True}, headers=u_hdr)
+    ).status_code == 200
+    rb = (await client.get("/api/v1/recycle-bin", headers=u_hdr)).json()
+    assert any(i["entity_type"] == "service" and i["id"] == svc["id"] for i in rb)
+    assert any(i["entity_type"] == "ip" and i["id"] == host_ip["id"] for i in rb)
+    assert (
+        await client.post(f"/api/v1/recycle-bin/service/{svc['id']}/restore", headers=u_hdr)
+    ).status_code == 200
+    assert (
+        await client.post(f"/api/v1/recycle-bin/ip/{host_ip['id']}/restore", headers=u_hdr)
+    ).status_code == 200
+
+    # 5. Duplicate cluster rename returns 409 (not 500)
+    assert (
+        await client.put(
+            f"/api/v1/clusters/{cl_a1['id']}",
+            json={"name": "R2-Cluster-2"},
+            headers=u_hdr,
+        )
+    ).status_code == 409

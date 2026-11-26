@@ -356,7 +356,28 @@ async def update_cluster(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="集群不存在")
     await require_entity_permission(db, auth, "cluster", cluster.id, cluster.group_id, "asset:write")
     if body.group_id is not None and body.group_id != cluster.group_id:
+        auth.require_group_permission("asset:write", cluster.group_id)
         auth.require_group_permission("asset:write", body.group_id)
+
+    new_name = body.name.strip() if body.name is not None else cluster.name
+    new_env = body.env if body.env is not None else cluster.env
+    if new_name != cluster.name or new_env != cluster.env:
+        env_cond = Cluster.env.is_(None) if new_env is None else (Cluster.env == new_env)
+        dup = (
+            await db.execute(
+                select(Cluster.id).where(
+                    Cluster.id != cluster.id,
+                    Cluster.name == new_name,
+                    env_cond,
+                    Cluster.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if dup is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"同环境下集群 '{new_name}' 已存在",
+            )
 
     before = {
         "name": cluster.name,
@@ -456,7 +477,12 @@ async def delete_cluster(
             await db.execute(
                 select(func.count())
                 .select_from(IPVIPBinding)
-                .where(IPVIPBinding.target_type == "cluster", IPVIPBinding.target_id == cluster.id)
+                .join(IPAddress, IPAddress.id == IPVIPBinding.ip_id)
+                .where(
+                    IPVIPBinding.target_type == "cluster",
+                    IPVIPBinding.target_id == cluster.id,
+                    IPAddress.deleted_at.is_(None),
+                )
             )
         ).scalar_one()
     )

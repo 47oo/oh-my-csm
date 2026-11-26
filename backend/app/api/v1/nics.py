@@ -574,7 +574,12 @@ async def delete_nic(
             await db.execute(
                 select(func.count())
                 .select_from(IPVIPBinding)
-                .where(IPVIPBinding.target_type == "nic", IPVIPBinding.target_id == nic.id)
+                .join(IPAddress, IPAddress.id == IPVIPBinding.ip_id)
+                .where(
+                    IPVIPBinding.target_type == "nic",
+                    IPVIPBinding.target_id == nic.id,
+                    IPAddress.deleted_at.is_(None),
+                )
             )
         ).scalar_one()
     )

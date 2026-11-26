@@ -296,10 +296,9 @@ async def create_ip(
         subnet = (await db.execute(sub_stmt)).scalar_one_or_none()
         if subnet is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="所属网段不存在")
-        if auto_allocated:
-            await require_entity_permission(
-                db, auth, "subnet", subnet.id, subnet.group_id, "asset:read"
-            )
+        await require_entity_permission(
+            db, auth, "subnet", subnet.id, subnet.group_id, "asset:read"
+        )
 
     zone_id = (
         body.network_zone_id
@@ -312,6 +311,9 @@ async def create_ip(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="所选网段不属于指定的网络域",
         )
+
+    if body.group_id is not None:
+        auth.require_group_permission("asset:write", body.group_id)
 
     group_id = (
         body.group_id
@@ -632,6 +634,7 @@ async def update_ip(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP 不存在")
     await require_entity_permission(db, auth, "ip", ip_obj.id, ip_obj.group_id, "asset:write")
     if body.group_id is not None and body.group_id != ip_obj.group_id:
+        auth.require_group_permission("asset:write", ip_obj.group_id)
         auth.require_group_permission("asset:write", body.group_id)
 
     ip_str = format_ip_str(ip_obj.ip_address)
@@ -715,6 +718,7 @@ async def update_ip(
 @router.delete("/{ip_id}", response_model=MessageResponse)
 async def delete_ip(
     ip_id: int,
+    force_unbind: bool = Query(default=False),
     auth: AuthContext = Depends(get_current_auth),
     db: AsyncSession = Depends(get_db),
 ) -> MessageResponse:
@@ -728,18 +732,19 @@ async def delete_ip(
     await require_entity_permission(db, auth, "ip", ip_obj.id, ip_obj.group_id, "asset:delete")
 
     blockers: list[str] = []
-    if ip_obj.nic_id is not None:
-        blockers.append("已绑定网卡")
+    if not force_unbind:
+        if ip_obj.nic_id is not None:
+            blockers.append("已绑定网卡")
 
-    vip_cnt = int(
-        (
-            await db.execute(
-                select(func.count()).select_from(IPVIPBinding).where(IPVIPBinding.ip_id == ip_obj.id)
-            )
-        ).scalar_one()
-    )
-    if vip_cnt:
-        blockers.append(f"{vip_cnt} 条 VIP 绑定")
+        vip_cnt = int(
+            (
+                await db.execute(
+                    select(func.count()).select_from(IPVIPBinding).where(IPVIPBinding.ip_id == ip_obj.id)
+                )
+            ).scalar_one()
+        )
+        if vip_cnt:
+            blockers.append(f"{vip_cnt} 条 VIP 绑定")
 
     ep_cnt = int(
         (
@@ -894,6 +899,22 @@ async def remove_vip_binding(
     ).scalar_one_or_none()
     if binding is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="VIP 绑定记录不存在")
+
+    model_map = {"nic": NIC, "cluster": Cluster, "service": Service}
+    target_model = model_map.get(binding.target_type)
+    if target_model is not None:
+        target = await db.get(target_model, binding.target_id)
+        if target is not None and target.deleted_at is None:
+            if binding.target_type == "nic":
+                nic_dev = await db.get(Device, target.device_id)
+                if nic_dev is not None and nic_dev.deleted_at is None:
+                    await require_entity_permission(
+                        db, auth, "device", nic_dev.id, nic_dev.group_id, "asset:write"
+                    )
+            else:
+                await require_entity_permission(
+                    db, auth, binding.target_type, target.id, target.group_id, "asset:write"
+                )
 
     await db.delete(binding)
     await db.flush()

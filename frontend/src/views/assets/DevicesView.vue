@@ -27,6 +27,7 @@ const filters = reactive({
 
 const modalOpen = ref(false)
 const editing = ref<DeviceItem | null>(null)
+const hiddenClusterIds = ref<number[]>([])
 const form = reactive({
   hostname: '',
   asset_code: '',
@@ -75,6 +76,7 @@ async function loadData() {
 
 function openCreate() {
   editing.value = null
+  hiddenClusterIds.value = []
   const defaultClusters =
     !auth.hasWritableGroup && auth.writableClusterIds.length ? [auth.writableClusterIds[0]] : []
   Object.assign(form, {
@@ -99,6 +101,11 @@ function openCreate() {
 
 function openEdit(row: DeviceItem) {
   editing.value = row
+  const visibleClusterSet = new Set(clusters.value.map((c) => c.id))
+  const allClusterIds = row.cluster_ids?.length
+    ? row.cluster_ids
+    : clusters.value.filter((c) => row.cluster_names.includes(c.name)).map((c) => c.id)
+  hiddenClusterIds.value = allClusterIds.filter((id) => !visibleClusterSet.has(id))
   Object.assign(form, {
     hostname: row.hostname,
     asset_code: row.asset_code || '',
@@ -113,13 +120,14 @@ function openEdit(row: DeviceItem) {
     rack_location: row.rack_location || '',
     owner: row.owner || '',
     description: row.description || '',
-    cluster_ids: clusters.value.filter((c) => row.cluster_names.includes(c.name)).map((c) => c.id),
+    cluster_ids: allClusterIds.filter((id) => visibleClusterSet.has(id)),
     tag_ids: row.tags.map((t) => t.id),
   })
   modalOpen.value = true
 }
 
 async function handleSave() {
+  const mergedClusterIds = Array.from(new Set([...form.cluster_ids, ...hiddenClusterIds.value]))
   const payload = {
     hostname: form.hostname,
     asset_code: form.asset_code || null,
@@ -134,7 +142,7 @@ async function handleSave() {
     rack_location: form.rack_location || null,
     owner: form.owner || null,
     description: form.description || null,
-    cluster_ids: form.cluster_ids,
+    cluster_ids: mergedClusterIds,
     tag_ids: form.tag_ids,
   }
   try {

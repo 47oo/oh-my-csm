@@ -61,16 +61,18 @@ async def _serialize_devices(
     zone_names = await load_zone_names(db, {r.network_zone_id for r in rows if r.network_zone_id})
     tag_map = await load_entity_tags(db, "device", ids)
 
-    # Cluster names
+    # Cluster IDs & names
     cl_rows = (
         await db.execute(
-            select(ClusterDevice.device_id, Cluster.name)
+            select(ClusterDevice.device_id, Cluster.id, Cluster.name)
             .join(Cluster, Cluster.id == ClusterDevice.cluster_id)
             .where(ClusterDevice.device_id.in_(ids), Cluster.deleted_at.is_(None))
         )
     ).all()
+    cl_id_map: dict[int, list[int]] = {did: [] for did in ids}
     cl_map: dict[int, list[str]] = {did: [] for did in ids}
-    for did, cname in cl_rows:
+    for did, cid, cname in cl_rows:
+        cl_id_map.setdefault(did, []).append(cid)
         cl_map.setdefault(did, []).append(cname)
 
     # NIC counts & bound IPs
@@ -133,6 +135,7 @@ async def _serialize_devices(
             description=r.description,
             extra_attrs=r.extra_attrs or {},
             tags=[TagBrief(**t) for t in tag_map.get(r.id, [])],
+            cluster_ids=cl_id_map.get(r.id, []),
             cluster_names=cl_map.get(r.id, []),
             nic_count=nic_counts.get(r.id, 0),
             primary_ips=ip_map.get(r.id, [])[:6],
@@ -269,6 +272,8 @@ async def create_device(
             await require_entity_permission(
                 db, auth, "cluster", cl.id, cl.group_id, "asset:write", scope=write_scope
             )
+    if body.group_id is not None:
+        auth.require_group_permission("asset:write", body.group_id)
     if not auth.has_permission_in_group("asset:write", body.group_id) and not unique_cids:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -520,6 +525,7 @@ async def update_device(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="设备不存在")
     await require_entity_permission(db, auth, "device", device.id, device.group_id, "asset:write")
     if body.group_id is not None and body.group_id != device.group_id:
+        auth.require_group_permission("asset:write", device.group_id)
         auth.require_group_permission("asset:write", body.group_id)
 
     before = {
@@ -598,6 +604,7 @@ async def update_device(
                 .all()
             }
             added_cids = new_cids - current_cids
+            removed_cids = current_cids - new_cids
             if any(cid not in cl_rows for cid in added_cids):
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="包含不存在的集群")
             for cid in changed_cids:
@@ -611,10 +618,16 @@ async def update_device(
                     "asset:write",
                     scope=write_scope,
                 )
-        await db.execute(delete(ClusterDevice).where(ClusterDevice.device_id == device.id))
-        for cid in sorted(new_cids):
-            db.add(ClusterDevice(cluster_id=cid, device_id=device.id))
-        await db.flush()
+            if removed_cids:
+                await db.execute(
+                    delete(ClusterDevice).where(
+                        ClusterDevice.device_id == device.id,
+                        ClusterDevice.cluster_id.in_(removed_cids),
+                    )
+                )
+            for cid in sorted(added_cids):
+                db.add(ClusterDevice(cluster_id=cid, device_id=device.id))
+            await db.flush()
 
     await sync_entity_tags(db, "device", device.id, body.tag_ids)
 

@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { h, onMounted, reactive, ref } from 'vue'
 import { NButton, NPopconfirm, NProgress, NSpace, NTag, useMessage, type DataTableColumns } from 'naive-ui'
-import { ipApi, nicApi, subnetApi, type NicItem, type SubnetItem } from '@/api/assets'
+import { clusterApi, ipApi, nicApi, subnetApi, type ClusterItem, type NicItem, type SubnetItem } from '@/api/assets'
 import { extractErrorMessage } from '@/api/client'
+import { useAuthStore } from '@/stores/auth'
 import { useOptionsStore } from '@/stores/options'
 import SubnetIpMatrix from '@/components/SubnetIpMatrix.vue'
 import AssetDetailDrawer from '@/components/AssetDetailDrawer.vue'
 
+const auth = useAuthStore()
 const options = useOptionsStore()
 const message = useMessage()
 
@@ -37,10 +39,12 @@ const matrixRefreshKey = ref(0)
 // Quick allocate from IP matrix cell
 const allocModalOpen = ref(false)
 const nics = ref<NicItem[]>([])
+const clusters = ref<ClusterItem[]>([])
 const allocForm = reactive({
   ip_address: '',
   ip_type: 'host' as 'host' | 'vip' | 'reserved' | 'floating' | 'gateway',
   nic_id: null as number | null,
+  cluster_id: null as number | null,
   status: 'allocated',
   usage: '',
 })
@@ -155,13 +159,21 @@ async function handleAllocateFromCell(ip: string) {
   allocForm.ip_address = ip
   allocForm.ip_type = 'host'
   allocForm.nic_id = null
+  allocForm.cluster_id =
+    !auth.hasWritableGroup && auth.writableClusterIds.length ? auth.writableClusterIds[0] : null
   allocForm.status = 'allocated'
   allocForm.usage = ''
   allocModalOpen.value = true
   try {
-    nics.value = (await nicApi.list({ page: 1, page_size: 200 })).data.items
+    const [nRes, cRes] = await Promise.all([
+      nicApi.list({ page: 1, page_size: 200 }),
+      clusterApi.list({ page: 1, page_size: 200 }),
+    ])
+    nics.value = nRes.data.items
+    clusters.value = cRes.data.items
   } catch {
     nics.value = []
+    clusters.value = []
   }
 }
 
@@ -171,10 +183,11 @@ async function submitQuickAlloc() {
     await ipApi.create({
       network_zone_id: activeSubnet.value.network_zone_id,
       subnet_id: activeSubnet.value.id,
-      group_id: activeSubnet.value.group_id,
+      group_id: auth.hasWritableGroup ? activeSubnet.value.group_id : null,
       ip_address: allocForm.ip_address,
       ip_type: allocForm.ip_type,
       nic_id: allocForm.nic_id,
+      cluster_id: !allocForm.nic_id || allocForm.ip_type === 'vip' ? allocForm.cluster_id : null,
       status: allocForm.status,
       usage: allocForm.usage || null,
     })
@@ -359,6 +372,15 @@ onMounted(loadData)
             clearable
             placeholder="可选（VIP/预留可留空）"
             :options="nics.map((n) => ({ label: `${n.device_hostname}:${n.name}`, value: n.id }))"
+          />
+        </n-form-item>
+        <n-form-item v-if="!allocForm.nic_id || allocForm.ip_type === 'vip'" label="归属集群">
+          <n-select
+            v-model:value="allocForm.cluster_id"
+            filterable
+            clearable
+            placeholder="未绑网卡或录入 VIP 时可绑定到目标集群"
+            :options="clusters.map((c) => ({ label: c.name, value: c.id }))"
           />
         </n-form-item>
         <n-form-item label="状态">

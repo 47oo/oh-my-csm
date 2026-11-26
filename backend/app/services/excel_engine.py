@@ -630,8 +630,14 @@ async def run_excel_import(
         group_id: int | None,
         cluster_ids: list[int] | None = None,
     ) -> None:
-        if auth.has_permission_in_group("excel:import", group_id) and auth.has_permission_in_group(
-            "asset:write", group_id
+        if group_id is not None:
+            if auth.has_permission_in_group(
+                "excel:import", group_id
+            ) and auth.has_permission_in_group("asset:write", group_id):
+                return
+            raise ValueError("缺少所填归属分组的 excel:import / asset:write 权限")
+        if auth.has_permission_in_group("excel:import", None) and auth.has_permission_in_group(
+            "asset:write", None
         ):
             return
         if cluster_ids and all(
@@ -1156,6 +1162,23 @@ async def run_excel_import(
                 ep_ip_str = (rec.get("ip_address") or "").strip()
                 ep_ip_id = _try_lookup_ip_id(ep_ip_str)
                 if ep_port or ep_cluster_id or ep_device_id or ep_ip_id:
+                    read_scope = await resolve_scope(db, auth, "asset:read")
+                    if ep_cluster_id is not None:
+                        ep_cl = await db.get(Cluster, ep_cluster_id)
+                        assert ep_cl is not None
+                        await _require_existing_perm("cluster", ep_cl.id, ep_cl.group_id)
+                    if (
+                        ep_device_id is not None
+                        and ep_dev_info is not None
+                        and not read_scope.allows("device", ep_device_id, ep_dev_info[1])
+                    ):
+                        raise ValueError(f"无权关联设备 '{rec.get('device_hostname')}'")
+                    if ep_ip_id is not None:
+                        ep_ip_obj = await db.get(IPAddress, ep_ip_id)
+                        if ep_ip_obj is not None and not read_scope.allows(
+                            "ip", ep_ip_obj.id, ep_ip_obj.group_id
+                        ):
+                            raise ValueError(f"无权关联 IP '{ep_ip_str}'")
                     ep_exists = (
                         await db.execute(
                             select(ServiceEndpoint.id).where(
@@ -1211,21 +1234,43 @@ async def run_excel_import(
                 svc_id = service_id_cache.get(svc_name) if svc_name else None
                 entry_ip_id = _try_lookup_ip_id(rec.get("entry_ip") or "")
 
-                if not (
-                    auth.has_permission_in_group("excel:import", gid)
-                    and auth.has_permission_in_group("asset:write", gid)
+                read_scope = await resolve_scope(db, auth, "asset:read")
+                svc_gid: int | None = None
+                if svc_id is not None:
+                    svc_obj_ref = await db.get(Service, svc_id)
+                    if svc_obj_ref is not None:
+                        svc_gid = svc_obj_ref.group_id
+                        if not read_scope.allows("service", svc_obj_ref.id, svc_gid):
+                            raise ValueError(f"无权关联服务 '{svc_name}'")
+                eip_gid: int | None = None
+                if entry_ip_id is not None:
+                    eip_obj_ref = await db.get(IPAddress, entry_ip_id)
+                    if eip_obj_ref is not None:
+                        eip_gid = eip_obj_ref.group_id
+                        if not read_scope.allows("ip", eip_obj_ref.id, eip_gid):
+                            raise ValueError(f"无权关联入口 IP '{rec.get('entry_ip')}'")
+
+                if gid is not None:
+                    if not (
+                        auth.has_permission_in_group("excel:import", gid)
+                        and auth.has_permission_in_group("asset:write", gid)
+                    ):
+                        raise ValueError("缺少所填归属分组的 excel:import / asset:write 权限")
+                elif not (
+                    auth.has_permission_in_group("excel:import", None)
+                    and auth.has_permission_in_group("asset:write", None)
                 ):
                     imp_scope = await resolve_scope(db, auth, "excel:import")
                     wrt_scope = await resolve_scope(db, auth, "asset:write")
                     ok_via_svc = (
                         svc_id is not None
-                        and imp_scope.allows("service", svc_id, gid)
-                        and wrt_scope.allows("service", svc_id, gid)
+                        and imp_scope.allows("service", svc_id, svc_gid)
+                        and wrt_scope.allows("service", svc_id, svc_gid)
                     )
                     ok_via_ip = (
                         entry_ip_id is not None
-                        and imp_scope.allows("ip", entry_ip_id, gid)
-                        and wrt_scope.allows("ip", entry_ip_id, gid)
+                        and imp_scope.allows("ip", entry_ip_id, eip_gid)
+                        and wrt_scope.allows("ip", entry_ip_id, eip_gid)
                     )
                     if not (ok_via_svc or ok_via_ip):
                         raise ValueError("缺少目标分组或关联集群的 excel:import / asset:write 权限")

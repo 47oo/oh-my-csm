@@ -9,7 +9,14 @@ OUT_DIR="${DEPLOY_DIR}/dist-offline"
 BUNDLE_NAME="oh-my-csm-offline-${VERSION}.tar.gz"
 
 echo "==> [1/4] Building backend & frontend Docker images..."
-docker compose -f "${DEPLOY_DIR}/docker-compose.yml" build
+if [ -f "${DEPLOY_DIR}/.env" ]; then
+  docker compose -f "${DEPLOY_DIR}/docker-compose.yml" build
+else
+  POSTGRES_PASSWORD="offline_build_placeholder" \
+  JWT_SECRET_KEY="offline_build_placeholder" \
+  CREDENTIAL_MASTER_KEY="offline_build_placeholder" \
+  docker compose -f "${DEPLOY_DIR}/docker-compose.yml" build
+fi
 
 echo "==> [2/4] Pulling postgres:16-alpine..."
 docker pull postgres:16-alpine

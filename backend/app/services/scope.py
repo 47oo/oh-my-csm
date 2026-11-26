@@ -136,6 +136,8 @@ async def resolve_scope(
     if ip_ids:
         ep_conds.append(ServiceEndpoint.ip_id.in_(ip_ids))
 
+    READ_ONLY_PENETRATION_PERMS = {"asset:read", "excel:export", "audit:read"}
+
     ep_stmt = (
         select(ServiceEndpoint.service_id, ServiceEndpoint.ip_id)
         .join(Service, Service.id == ServiceEndpoint.service_id)
@@ -147,7 +149,7 @@ async def resolve_scope(
     service_ids: set[int] = set()
     for sid, ep_ip_id in ep_rows:
         service_ids.add(sid)
-        if ep_ip_id is not None:
+        if ep_ip_id is not None and permission in READ_ONLY_PENETRATION_PERMS:
             ip_ids.add(ep_ip_id)
 
     # Also include VIPs bound directly to those services
@@ -177,9 +179,9 @@ async def resolve_scope(
             url_stmt = url_stmt.where(UrlEntry.deleted_at.is_(None))
         url_ids = set((await db.execute(url_stmt)).scalars().all())
 
-    # 5. Subnets containing any penetrated IPs
+    # 5. Subnets containing any penetrated IPs (read/export/audit only — never grant write/delete on shared subnets!)
     subnet_ids: set[int] = set()
-    if ip_ids:
+    if ip_ids and permission in READ_ONLY_PENETRATION_PERMS:
         sub_stmt = (
             select(IPAddress.subnet_id)
             .where(IPAddress.id.in_(ip_ids), IPAddress.subnet_id.is_not(None))

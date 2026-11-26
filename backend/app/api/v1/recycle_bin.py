@@ -152,17 +152,42 @@ async def _check_restore_conflict(db: AsyncSession, entity_type: str, obj: Any) 
             return f"同环境下已存在同名集群 '{obj.name}'"
 
     elif entity_type == "service":
+        env_cond = Service.env.is_(None) if obj.env is None else (Service.env == obj.env)
         c = (
             await db.execute(
                 select(Service.id).where(
                     Service.name == obj.name,
-                    Service.env == obj.env,
+                    env_cond,
                     Service.deleted_at.is_(None),
                 )
             )
         ).scalar_one_or_none()
         if c is not None:
             return f"同环境下已存在同名服务 '{obj.name}'"
+
+    elif entity_type == "ops_group":
+        c = (
+            await db.execute(
+                select(OpsGroup.id).where(
+                    (OpsGroup.code == obj.code) | (OpsGroup.name == obj.name),
+                    OpsGroup.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if c is not None:
+            return f"已存在同名或同编码运维分组 '{obj.name} ({obj.code})'"
+
+    elif entity_type == "network_zone":
+        c = (
+            await db.execute(
+                select(NetworkZone.id).where(
+                    (NetworkZone.code == obj.code) | (NetworkZone.name == obj.name),
+                    NetworkZone.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if c is not None:
+            return f"已存在同名或同编码网络域 '{obj.name} ({obj.code})'"
 
     return None
 
